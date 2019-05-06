@@ -5,23 +5,30 @@ This prevents the ghidra_bridge imported by ghidra_bridge_server being loaded ov
 You probably only want this for stuff imported by the ghidra_bridge_server script that might conflict on the local side (or which
 is totally unnecessary on the local side, like GhidraBridgeServer).
 """
-EXCLUDED_REMOTE_IMPORTS = ["logging", "subprocess", "ghidra_bridge", "GhidraBridgeServer"]
+EXCLUDED_REMOTE_IMPORTS = ["logging", "subprocess",
+                           "ghidra_bridge", "bridge", "GhidraBridgeServer"]
 
 GHIDRA_BRIDGE_NAMESPACE_TRACK = "__ghidra_bridge_namespace_track__"
 
 
 class GhidraBridge():
-    def __init__(self, server_host="127.0.0.1", server_port=0, connect_to_host=bridge.DEFAULT_HOST, connect_to_port=bridge.DEFAULT_SERVER_PORT, start_in_background=True, loglevel=None, namespace=None):
-        """ Set up a bridge. Default settings are for a client - connect to the default ghidra bridge server, set up a listening server on a random
-        port, and start it in a background thread. For a ghidra bridge server, specify the server_port, set connect_to_* to None and set
-        start_in_background to False
+    def __init__(self, connect_to_host=bridge.DEFAULT_HOST, connect_to_port=bridge.DEFAULT_SERVER_PORT, loglevel=None, namespace=None, interactive_mode=True):
+        """ Set up a bridge. Default settings connect to the default ghidra bridge server,
 
-        If namespace is specified (e.g., locals() or globals()), automatically calls get_flat_api() with that namespace. Note that this requires
-        connect_to_host and connect_to_port to not be None
+        If namespace is specified (e.g., locals() or globals()), automatically calls get_flat_api() with that namespace. 
+
+        loglevel for what logging messages you want to capture
+
+        interactive_mode should auto-detect interactive environments (e.g., ipython or not in a script), but 
+        you can force it to True or False if you need to. False is normal ghidra script behaviour 
+        (currentAddress/getState() etc locked to the values when the script started. True is closer to the 
+        behaviour in the Ghidra Jython shell - current*/getState() reflect the current values in the GUI
         """
-        self.bridge = bridge.Bridge(server_host=server_host, server_port=server_port,
-                                    connect_to_host=connect_to_host, connect_to_port=connect_to_port,
-                                    start_in_background=start_in_background, loglevel=loglevel)
+        self.bridge = bridge.BridgeClient(
+            connect_to_host=connect_to_host, connect_to_port=connect_to_port, loglevel=loglevel)
+
+        self.interactive_mode = interactive_mode
+        self.interactive_listener = None
 
         self.namespace = None
         if namespace is not None:
@@ -43,6 +50,37 @@ class GhidraBridge():
 
         remote_main = self.bridge.remote_import("__main__")
 
+        if self.interactive_mode:
+            if self.interactive_listener is None:
+                # define the interactive listener here, because we need the remote ghidra object
+
+                # this fails because it's expecting a type, not a BridgedObject. BridgedObject.__init__ is getting called, not type.__init__(self, /, args, kwargs)
+                # could we simply fake this? add an extra arg to the bridgedobject init and see?
+                class InteractiveListener(remote_main.ghidra.framework.model.ToolListener):
+                    def __init__(self, tool):
+                        self.tool = tool
+                        self.update_list = []
+
+                        # register the listener against the remote tool
+                        tool.addToolListener(self)
+
+                    def __del__(self):
+                        # we're done, make sure we remove the tool listener
+                        self.tool.removeToolListener(self)
+
+                    def add_to_update_list(self, namespace):
+                        self.update_list.append(namespace)
+
+                    def processToolEvent(self, plugin_event):
+                        """ Called by the ToolListener interface """
+                        print("hi!")
+                        print(plugin_event)
+
+                x = remote_main.ghidra.framework.model.ToolListener
+
+                tool = remote_main.state.getTool()
+                self.interactive_listener = InteractiveListener(tool)
+
         if namespace is not None:
             # add a special var to the namespace to track what we add, so we can remove it easily later
             namespace[GHIDRA_BRIDGE_NAMESPACE_TRACK] = dict()
@@ -63,7 +101,8 @@ class GhidraBridge():
         """
         if namespace is None:
             if self.namespace is None:
-                raise Exception("Bridge wasn't initialized with a namespace - need to specify the namespace you want to unload from")
+                raise Exception(
+                    "Bridge wasn't initialized with a namespace - need to specify the namespace you want to unload from")
             namespace = self.namespace
 
         if GHIDRA_BRIDGE_NAMESPACE_TRACK in namespace:

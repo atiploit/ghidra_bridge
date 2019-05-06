@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """ Handles converting data back and forward between 2 and 3 """
 
 from __future__ import unicode_literals  # string literals are all unicode
@@ -8,7 +7,6 @@ except Exception:
     import socketserver  # py3
 
 import logging
-import unittest
 import traceback
 import json
 import base64
@@ -44,7 +42,10 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_SERVER_PORT = 4768  # "Gh"
 
 VERSION = "v"
+MAX_VERSION = "max_v"
+MIN_VERSION = "min_v"
 COMMS_VERSION_1 = 1
+COMMS_VERSION_2 = 2
 TYPE = "type"
 VALUE = "value"
 KEY = "key"
@@ -62,8 +63,6 @@ OBJ = "obj"
 CALLABLE_OBJ = "callable_obj"
 BASES = "bases"
 
-HOST = "host"
-PORT = "port"
 MESSAGE = "message"
 CMD = "cmd"
 ID = "ID"
@@ -84,7 +83,9 @@ KWARGS = "kwargs"
 
 BRIDGE_PREFIX = "_bridge"
 
-MAX_SUPPORTED_COMMS_VERSION = COMMS_VERSION_1
+# Comms v2 (alpha) completely restructures the comms layer, breaking backwards compatability :(
+MIN_SUPPORTED_COMMS_VERSION = COMMS_VERSION_2
+MAX_SUPPORTED_COMMS_VERSION = COMMS_VERSION_2
 
 
 class BridgeException(Exception):
@@ -128,47 +129,100 @@ def read_size_and_data_from_socket(sock):
 
 def can_handle_version(message_dict):
     """ Utility function for checking we know about this version """
-    return message_dict[VERSION] <= MAX_SUPPORTED_COMMS_VERSION
+    return (message_dict[VERSION] <= MAX_SUPPORTED_COMMS_VERSION) and (message_dict[VERSION] >= MIN_SUPPORTED_COMMS_VERSION)
+
+
+class BridgeCommandHandlerThread(threading.Thread):
+    """ class to handle running a thread to handle processing a command """
+    bridge_conn = None
+    data = None
+
+    ERROR_RESULT = json.dumps({ERROR: True})
+
+    def __init__(self, bridge_conn, msg_dict):
+        super(BridgeCommandHandlerThread, self).__init__()
+
+        self.bridge_conn = bridge_conn
+        self.msg_dict = msg_dict
+        # don't let the command handlers keep us alive
+        self.daemon = True
+
+    def run(self):
+        # handle a command and write back the response
+        # TODO make this return an error tied to the cmd_id, so it goes in the response mgr
+        result = BridgeCommandHandlerThread.ERROR_RESULT
+        try:
+            result = self.bridge_conn.handle_command(self.msg_dict)
+        except Exception as e:
+            self.bridge_conn.logger.error(
+                "Unexpected exception: {}".format(e))
+                
+        try:
+            write_size_and_data_to_socket(self.bridge_conn.get_socket(), result)
+        except socket.error:
+            # Other end has closed the socket before we can respond. That's fine, just ask me to do something then ignore me. Jerk.
+            pass
+
+
+class BridgeReceiverThread(threading.Thread):
+    """ class to handle running a thread to receive bridge commands/responses and direct accordingly """
+
+    # If we don't know how to handle the version, reply back with an error and the highest version we do support
+    ERROR_UNSUPPORTED_VERSION = json.dumps(
+        {ERROR: True, MAX_VERSION: MAX_SUPPORTED_COMMS_VERSION, MIN_VERSION: MIN_SUPPORTED_COMMS_VERSION})
+
+    def __init__(self, bridge_conn):
+        super(BridgeReceiverThread, self).__init__()
+
+        self.bridge_conn = bridge_conn
+
+        # don't let the recv loop keep us alive
+        self.daemon = True
+
+    def run(self):
+        while True:  # TODO shutdown flag
+            try:
+                data = read_size_and_data_from_socket(
+                    self.bridge_conn.get_socket())
+            except socket.timeout:
+                # client didn't have anything to say - just wait some more
+                time.sleep(0.1)
+                continue
+
+            try:
+                msg_dict = json.loads(data.decode("utf-8"))
+                self.bridge_conn.logger.debug(
+                    "Recv loop received {}".format(msg_dict))
+
+                if can_handle_version(msg_dict):
+                    if msg_dict[TYPE] == RESULT:
+                        # handle a response
+                        self.bridge_conn.response_mgr.add_response(msg_dict)
+                    else:
+                        # TODO actually, queue this and hand off to a worker thread(pool)
+                        # spawn thread to handle request, up to max threads TODO
+                        handler_thread = BridgeCommandHandlerThread(
+                            self.bridge_conn, msg_dict)
+                        handler_thread.start()
+                else:
+                    # bad version
+                    write_size_and_data_to_socket(
+                        self.response_socket, BridgeReceiverThread.ERROR_UNSUPPORTED_VERSION)
+            except Exception as e:
+                # eat exceptions and continue, don't want a bad message killing the recv loop
+                self.bridge_conn.logger.exception(e)
 
 
 class BridgeCommandHandler(socketserver.BaseRequestHandler):
-    ERROR_RESULT = json.dumps({ERROR: True})
-    # If we don't know how to handle the version, reply back with an error and the highest version we do support
-    ERROR_UNSUPPORTED_VERSION = json.dumps(
-        {ERROR: True, VERSION: MAX_SUPPORTED_COMMS_VERSION})
 
     def handle(self):
         """ handle a new client connection coming in - continue trying to read/service requests in a loop until we fail to send/recv """
-        connection = None
+        self.server.bridge.logger.info(
+            "Handling connection from {}".format(self.request.getpeername()))
         try:
-            self.server.bridge.logger.info(
-                "Handling connection from {}".format(self.request.getpeername()))
-            while True:
-                # self.request is the TCP socket connected to the client
-                try:
-                    self.data = read_size_and_data_from_socket(self.request)
-                except socket.timeout:
-                    # client didn't have anything to say - just wait some more
-                    time.sleep(0.1)
-                    continue
-
-                msg_dict = json.loads(self.data.decode("utf-8"))
-
-                result = BridgeCommandHandler.ERROR_UNSUPPORTED_VERSION
-                if can_handle_version(msg_dict):
-                    result = BridgeCommandHandler.ERROR_RESULT
-
-                    if connection is None:
-                        connection = self.server.bridge.create_connection(
-                            msg_dict)
-
-                    try:
-                        result = connection.handle_command(msg_dict)
-                    except Exception as e:
-                        self.server.bridge.logger.error(
-                            "Unexpected exception: {}".format(e))
-
-                write_size_and_data_to_socket(self.request, result)
+            # run the recv loop directly
+            BridgeReceiverThread(BridgeConn(
+                self.server.bridge, self.request)).run()
         except Exception:
             # something's failed - most likely, the client has closed the connection
             self.server.bridge.logger.info(
@@ -189,10 +243,78 @@ class BridgeHandle(object):
         return "BridgeHandle({}: {})".format(self.handle, self.local_obj)
 
 
+class BridgeResponse(object):
+    """ Utility class for waiting for and receiving responses """
+    event = None  # used to flag whether the response is ready
+    response = None
+
+    def __init__(self):
+        self.event = threading.Event()
+
+    def set(self, response):
+        """ store response data, and let anyone waiting know it's ready """
+        self.response = response
+        # trigger the event
+        self.event.set()
+
+    def get(self, timeout=None):
+        """ wait for the response """
+        if not self.event.wait(timeout):
+            raise Exception()
+
+        return self.response
+
+
+class BridgeResponseManager(object):
+    """ Handles waiting for and receiving responses """
+    response_dict = None  # maps response ids to a BridgeResponse
+    response_lock = None
+
+    def __init__(self):
+        self.response_dict = dict()
+        self.response_lock = threading.Lock()
+
+    def add_response(self, response_dict):
+        """ response received - register it, then set the event for it """
+        with self.response_lock:
+            response_id = response_dict[ID]
+            if response_id not in self.response_dict:
+                # response hasn't been waited for yet. create the entry
+                self.response_dict[response_id] = BridgeResponse()
+
+            # set the data and trigger the event
+            self.response_dict[response_id].set(response_dict)
+
+    def get_response(self, response_id, timeout=None):
+        """ Register for a response and wait until received """
+        event = None
+        with self.response_lock:
+            if response_id not in self.response_dict:
+                # response hasn't been waited for yet. create the entry
+                self.response_dict[response_id] = BridgeResponse()
+            response = self.response_dict[response_id]
+
+        data = None
+        try:
+            # wait for the data
+            data = response.get(timeout)
+        except:
+            raise Exception(
+                "Didn't receive response {} before timeout".format(response_id))
+
+        with self.response_lock:
+            # delete the entry, we're done here
+            del self.response_dict[response_id]
+
+        return data
+
+
 class BridgeConn(object):
     """ Internal class, representing a connection to a remote bridge that serves our requests """
 
-    def __init__(self, bridge, connect_to_host, connect_to_port):
+    RESPONSE_TIMEOUT = 1  # seconds
+
+    def __init__(self, bridge, sock=None, connect_to_host=None, connect_to_port=None):
         """ Set up the bridge connection - only instantiates a connection as needed """
         self.host = connect_to_host
         self.port = connect_to_port
@@ -200,23 +322,16 @@ class BridgeConn(object):
         # get a reference to the bridge's logger for the connection
         self.logger = bridge.logger
 
-        self.logger.debug(
-            "Creating BridgeConn for {}:{}".format(self.host, self.port))
-
         self.handle_dict = {}
 
-        self.sock = None
+        self.sock = sock
         self.comms_lock = threading.RLock()
         self.handle_lock = threading.Lock()
 
-        # record the server info, to stamp into all commands
-        # TODO get the server host on the receiver end (e.g., it'll be the same address as the request originated from)
-        self.server_host, self.server_port = bridge.get_server_info()
+        self.response_mgr = BridgeResponseManager()
 
     def __del__(self):
         """ On teardown, make sure we close our socket to the remote bridge """
-        self.logger.debug(
-            "Deleting BridgeConn for {}:{}".format(self.host, self.port))
         with self.comms_lock:
             if self.sock is not None:
                 self.sock.close()
@@ -329,35 +444,40 @@ class BridgeConn(object):
                 self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.sock.settimeout(10)
                 self.sock.connect((self.host, self.port))
+                # spin up the recv loop thread in the background
+                BridgeReceiverThread(self).start()
 
             return self.sock
 
-    def send_cmd(self, command_dict):
-        self.logger.debug("Sending {}".format(command_dict))
-        envelope_dict = {VERSION: COMMS_VERSION_1,
-                         HOST: self.server_host,
-                         PORT: self.server_port, MESSAGE: command_dict}
+    def send_cmd(self, command_dict, get_response=True):
+        """ Package and send a command off. If get_response set, wait for the response and return it. Else return none """
+        cmd_id = str(uuid.uuid4())  # used to link commands and responses
+        envelope_dict = {VERSION: COMMS_VERSION_2,
+                         ID: cmd_id,
+                         TYPE: CMD,
+                         CMD: command_dict}
+        self.logger.debug("Sending {}".format(envelope_dict))
         data = json.dumps(envelope_dict).encode("utf-8")
-
-        received = None
-        result = {}
 
         with self.comms_lock:
             sock = self.get_socket()
 
-            # send the data
-            write_size_and_data_to_socket(sock, data)
+        # send the data
+        write_size_and_data_to_socket(sock, data)
 
-            # get the response
-            received = read_size_and_data_from_socket(sock)
+        if get_response:
+            result = {}
+            # wait for the response
+            response_dict = self.response_mgr.get_response(
+                cmd_id, timeout=self.RESPONSE_TIMEOUT)
 
-        if received is not None:
-            self.logger.debug("Received: {}".format(received))
-            response_dict = json.loads(received.decode("utf-8"))
-            if RESULT in response_dict:
-                result = response_dict[RESULT]
-
-        return result
+            if response_dict is not None:
+                self.logger.debug("Received: {}".format(response_dict))
+                if RESULT in response_dict:
+                    result = response_dict[RESULT]
+            return result
+        else:
+            return None
 
     def remote_get(self, handle, name):
         self.logger.debug("remote_get: {}.{}".format(handle, name))
@@ -435,7 +555,7 @@ class BridgeConn(object):
     def remote_del(self, handle):
         self.logger.debug("remote_del {}".format(handle))
         command_dict = {CMD: DEL, ARGS: {HANDLE: handle}}
-        self.send_cmd(command_dict)
+        self.send_cmd(command_dict, get_response=False)
 
     def local_del(self, args_dict):
         handle = args_dict[HANDLE]
@@ -485,11 +605,14 @@ class BridgeConn(object):
         return self.serialize_to_dict(result)
 
     def handle_command(self, message_dict):
-        command_dict = message_dict[MESSAGE]
 
-        response_dict = dict()
+        response_dict = {VERSION: COMMS_VERSION_2,
+                         ID: message_dict[ID],
+                         TYPE: RESULT,
+                         RESULT: {}}
 
-        response_dict[RESULT] = {}
+        command_dict = message_dict[CMD]
+
         if command_dict[CMD] == GET:
             response_dict[RESULT] = self.local_get(command_dict[ARGS])
         elif command_dict[CMD] == SET:
@@ -503,20 +626,23 @@ class BridgeConn(object):
         elif command_dict[CMD] == TYPE:
             response_dict[RESULT] = self.local_type_create(command_dict[ARGS])
 
+        self.logger.debug("Responding with {}".format(response_dict))
         return json.dumps(response_dict).encode("utf-8")
 
 
-class Bridge(object):
-    """ Python2Python RPC bridge """
+class BridgeServer(threading.Thread):
+    """ Python2Python RPC bridge server 
 
-    def __init__(self, server_host="127.0.0.1", server_port=0, connect_to_host="127.0.0.1", connect_to_port=None, start_in_background=True, loglevel=None):
+        Like a thread, so call run() to run directly, or start() to run on a background thread
+    """
+
+    def __init__(self, server_host=DEFAULT_HOST, server_port=0, loglevel=None):
         """ Set up the bridge.
 
             server_host/port: host/port to listen on to serve requests. If not specified, defaults to 127.0.0.1:0 (random port - use get_server_info() to find out where it's serving)
-            connect_to_host/port - host/port to connect to run commands. If host not specified, is 127.0.0.1. If port not specified, is a pure server.
-            start_in_background - if true, start a thread to serve on before returning. If false, caller will need to start manually
-
-            """
+            loglevel - what messages to log
+        """
+        super(BridgeServer, self).__init__()
 
         # init the server
         self.server = ThreadingTCPServer(
@@ -524,7 +650,7 @@ class Bridge(object):
         # the server needs to be able to get back to the bridge to handle commands, but we don't want that reference keeping the bridge alive
         self.server.bridge = weakref.proxy(self)
         self.server.timeout = 1
-        self.server_thread = None
+        self.daemon = True
         self.is_serving = False
 
         logging.basicConfig()
@@ -534,29 +660,15 @@ class Bridge(object):
 
         self.logger.setLevel(loglevel)
 
-        self.connect_to_host = None
-        if connect_to_port is not None:
-            self.connect_to_host = connect_to_host
-            self.connect_to_port = connect_to_port
-            self.client = BridgeConn(self, connect_to_host, connect_to_port)
-
-        if start_in_background:
-            self.start_on_thread()
-
     def get_server_info(self):
         """ return where the server is serving on """
         return self.server.socket.getsockname()
 
-    def start(self):
+    def run(self):
         self.logger.info("serving!")
         self.is_serving = True
         self.server.serve_forever()
         self.logger.info("stopped serving")
-
-    def start_on_thread(self):
-        self.server_thread = threading.Thread(target=self.start)
-        self.server_thread.daemon = True
-        self.server_thread.start()
 
     def __del__(self):
         self.shutdown()
@@ -567,23 +679,29 @@ class Bridge(object):
             self.is_serving = False
             self.server.server_close()
 
-    def create_connection(self, message_dict):
-        """ Create a bridge connection based on a request that's come in """
 
-        conn_host = message_dict[HOST]
-        conn_port = message_dict[PORT]
+class BridgeClient(object):
+    """ Python2Python RPC bridge client """
 
-        connection = None
-        if self.connect_to_host == conn_host and self.connect_to_port == conn_port:
-            # this is a connection back from the bridge we're already connected to, so reuse that connection to make sure the handles are the same
-            connection = self.client
-        else:
-            connection = BridgeConn(self, conn_host, conn_port)
+    def __init__(self, connect_to_host=DEFAULT_HOST, connect_to_port=DEFAULT_SERVER_PORT, loglevel=None):
+        """ Set up the bridge client
+            connect_to_host/port - host/port to connect to run commands. 
+            loglevel - what messages to log
+        """
+        logging.basicConfig()
+        self.logger = logging.getLogger(__name__)
+        if loglevel is None:  # we don't want any logging - ignore everything
+            loglevel = logging.CRITICAL+1
 
-        return connection
+        self.logger.setLevel(loglevel)
+
+        self.client = BridgeConn(
+            self, sock=None, connect_to_host=connect_to_host, connect_to_port=connect_to_port)
 
     def remote_import(self, module_name):
         return self.client.remote_import(module_name)
+
+    # TODO shutdown
 
 
 class BridgedObject(object):
@@ -653,11 +771,6 @@ class BridgedCallable(BridgedObject):
             bases = obj_dict
             # dct is the class dictionary
             dct = class_init
-            print("cls={}".format(cls))
-            print("name={}".format(name))
-            print("bases={}".format(bases))
-            print("dct={}".format(dct))
-            print(type(bases[0]))
             assert isinstance(bases[0], BridgedCallable)
             # create the class remotely, and return the BridgedCallable back to it
             return bases[0]._bridge_conn.remote_type_create(name, bases, dct)
@@ -678,181 +791,3 @@ class BridgedCallable(BridgedObject):
 
     def __repr__(self):
         return "<BridgedCallable({}, handle={})>".format(self._bridge_type, self._bridge_handle)
-
-
-class TestBridge(unittest.TestCase):
-    """ Assumes there's a bridge server running at DEFAULT_SERVER_PORT """
-
-    @classmethod
-    def setUpClass(cls):
-        TestBridge.test_bridge = Bridge(connect_to_port=DEFAULT_SERVER_PORT)
-
-    def test_import(self):
-
-        mod = TestBridge.test_bridge.remote_import("base64")
-        self.assertTrue(mod is not None)
-
-    def test_call_no_args(self):
-
-        mod = TestBridge.test_bridge.remote_import("uuid")
-
-        result = mod.uuid4()
-
-        self.assertTrue(result is not None)
-
-    def test_call_arg(self):
-        # also tests call with bytestring arg
-
-        mod = TestBridge.test_bridge.remote_import("base64")
-
-        test_str = str(uuid.uuid4())
-        result = mod.b64encode(test_str.encode("utf-8"))
-
-        result_str = base64.b64decode(result).decode("utf-8")
-
-        self.assertEqual(test_str, result_str)
-
-    def test_call_multi_args(self):
-        mod = TestBridge.test_bridge.remote_import("re")
-
-        remote_obj = mod.compile("foo", mod.IGNORECASE)
-
-        self.assertTrue(remote_obj is not None)
-
-        self.assertTrue(remote_obj.match("FOO") is not None)
-
-    def test_call_with_remote_obj(self):
-
-        mod = TestBridge.test_bridge.remote_import("uuid")
-
-        remote_obj = mod.uuid4()
-        result = str(remote_obj)
-        self.assertTrue(result is not None)
-        self.assertTrue("-" in result and "4" in result)
-
-    def test_call_with_str(self):
-        """ also tests calling str() on remote obj """
-
-        mod = TestBridge.test_bridge.remote_import("uuid")
-
-        test_uuid_str = "00010203-0405-0607-0809-0a0b0c0d0e0f"
-
-        remote_uuid = mod.UUID(test_uuid_str)
-        self.assertTrue(remote_uuid is not None)
-        result = str(remote_uuid)
-        self.assertEqual(test_uuid_str, result)
-
-    # bool, int, list, tuple, dict, bytes, bridge object, callback, exception, none
-    # set a function into the remote __main__/globals() to call
-    # callback as key func in list.sort
-
-    def test_call_kwargs(self):
-        pass
-
-    def test_get(self):
-        mod = TestBridge.test_bridge.remote_import("uuid")
-        remote_doc = mod.__doc__
-        self.assertTrue("RFC 4122" in remote_doc)
-
-    def test_set(self):
-        test_string = "hello world"
-        mod = TestBridge.test_bridge.remote_import("__main__")
-        mod.test = test_string
-
-        self.assertEqual(test_string, mod.test)
-
-    def test_get_non_existent(self):
-        mod = TestBridge.test_bridge.remote_import("re")
-
-        remote_obj = mod.compile("foo")
-
-        with self.assertRaises(BridgeException):
-            remote_obj.doesnt_exist
-
-    def test_get_callable(self):
-        mod = TestBridge.test_bridge.remote_import("re")
-
-        remote_obj = mod.compile("foo")
-
-        remote_callable = remote_obj.search
-        self.assertTrue(isinstance(remote_callable, BridgedCallable))
-
-    def test_callable(self):
-        mod = TestBridge.test_bridge.remote_import("re")
-
-        remote_obj = mod.compile("foo")
-
-        remote_callable = remote_obj.match
-
-        self.assertTrue(remote_callable("fooa") is not None)
-
-    def test_serialize_deserialize_types(self):
-        mod = TestBridge.test_bridge.remote_import("__main__")
-        remote_list = mod.__builtins__.list
-
-        # assemble a list of different types
-        test_list = [1, 0xFFFFFFFF, True, "string", "unicode_string🐉🔍",
-                     (1, 2, 3), [4, 5, 6], {7: 8, 9: 10}, uuid.uuid4(), pow]
-
-        # send the list in to create a remote list (which comes straight back)s
-        created_list = remote_list(test_list)
-
-        # check it's the same
-        self.assertEqual(test_list, created_list)
-
-    def test_serialize_deserialize_bytes(self):
-        """ byte strings across 2<->3 bridges will be forced to strings (because py2 treats bytes and strs as the same thing """
-        mod = TestBridge.test_bridge.remote_import("__main__")
-        remote_list = mod.__builtins__.list
-
-        test_list = [b"bytes"]
-
-        # send the list in to create a remote list (which comes straight back)s
-        created_list = remote_list(test_list)
-
-        # check it's the same, either as a byte or normal string
-        self.assertTrue(created_list[0] == test_list[0]
-                        or created_list[0] == test_list[0].decode("utf-8"))
-
-    def test_serialize_deserialize_bridge_object(self):
-        # bridge objects TODO
-        pass
-
-    def test_none_result(self):
-        mod = TestBridge.test_bridge.remote_import("re")
-
-        remote_obj = mod.compile("foo")
-
-        remote_callable = remote_obj.search
-
-        self.assertTrue(remote_callable("abar") is None)
-
-    def test_exception(self):
-        pass
-
-    def test_multiple_clients(self):
-        pass
-
-    def test_callback(self):
-        """ Test we correctly handle calling back to here from across the bridge """
-        def sort_fn(val):
-            return len(val)
-
-        mod = TestBridge.test_bridge.remote_import("__main__")
-        remote_sorted = mod.__builtins__.sorted
-
-        test_list = ["aaa", "bb", "c"]
-        sorted_list = remote_sorted(test_list, key=sort_fn)
-
-        self.assertEqual(sorted(test_list, key=sort_fn), sorted_list)
-
-    def test_remote_iterable(self):
-        """ Test we can access values from a remote iterable """
-        mod = TestBridge.test_bridge.remote_import("__main__")
-        remote_range = mod.__builtins__.range
-
-        remote_it = remote_range(4, 10, 2)
-
-        it_values = list(remote_it)
-
-        self.assertEqual(list(range(4, 10, 2)), it_values)
