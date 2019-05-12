@@ -58,6 +58,7 @@ Tested
 
 TODO
 =====================
+* Ghidra plugin for server control (cleaner start/stop, port selection, easy packaging/install)
 * Exceptions - pull traceback info in the exceptions we handle for pushing back
 * Better transport/serialization (JSON/TCP just feels wrong)
 * Keep stats of remote queries, so users can ID the parts of their scripts causing the most remote traffic for optimisation
